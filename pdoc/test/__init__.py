@@ -1049,6 +1049,10 @@ code
 <dd>description didn't work across multiple lines
 if only a single item was listed. <code>inspect.cleandoc()</code>
 somehow stripped the required extra indentation.</dd>
+<dt><code>str</code></dt>
+<dd>This is a test to demonstrate issue #146.</dd>
+<dt><code>Dict[str, str]</code></dt>
+<dd>This is a test to demonstrate issue #146 with a complex type.</dd>
 </dl>
 <h2 id="raises">Raises</h2>
 <dl>
@@ -1078,6 +1082,7 @@ that are relevant to the interface.</p>
 </ul>'''
         text = inspect.getdoc(self._docmodule.google)
         html = to_html(text, module=self._module, link=self._link)
+        self.assertEqual.__self__.maxDiff = None
         self.assertEqual(html, expected)
 
     def test_doctests(self):
