@@ -332,20 +332,25 @@ def _toposort(graph: Dict[T, Set[T]]) -> Generator[T, None, None]:
     assert not graph, "A cyclic dependency exists amongst %r" % graph
 
 
-def _return_annotation(name, module, obj, link=None):
+def _return_annotation(doc_obj, link=None):
     try:
-        annot = typing.get_type_hints(obj).get('return', '')
+        annot = typing.get_type_hints(doc_obj.obj)['return']
     except NameError as e:
-        warn("Error handling return annotation for {}: {}".format(name, e.args[0]))
-        annot = inspect.signature(inspect.unwrap(obj)).return_annotation
-        if annot == inspect.Parameter.empty:
+        warn("Error handling return annotation for {}: {}".format(doc_obj.refname, e.args[0]))
+        annot = inspect.signature(doc_obj.obj).return_annotation
+    except (KeyError, TypeError):
+        try:
+            # Extract annotation from the docstring for C builtin function
+            annot = Function._signature_from_string(doc_obj).return_annotation
+        except AttributeError:
             annot = ''
-    if not annot:
+
+    if annot is inspect.Parameter.empty or not annot:
         return ''
     s = inspect.formatannotation(annot).replace(' ', '\N{NBSP}')  # Better line breaks
     if link:
         from pdoc.html_helpers import _linkify
-        s = re.sub(r'[\w\.]+', partial(_linkify, link=link, module=module), s)
+        s = re.sub(r'[\w\.]+', partial(_linkify, link=link, module=doc_obj.module), s)
     return s
 
 
@@ -813,7 +818,7 @@ class Class(Doc):
     """
     Representation of a class' documentation.
     """
-    __slots__ = ('doc', '_super_members')
+    __slots__ = ('doc', '_super_members', '_cached_docstring_signature')
 
     def __init__(self, name, module, obj, *, docstring=None):
         assert inspect.isclass(obj)
@@ -1040,7 +1045,7 @@ class Function(Doc):
     """
     Representation of documentation for a function or method.
     """
-    __slots__ = ('cls', 'method')
+    __slots__ = ('cls', 'method', '_cached_docstring_signature')
 
     def __init__(self, name, module, obj, *, cls: Class = None, method=False):
         """
@@ -1093,19 +1098,7 @@ class Function(Doc):
 
     def return_annotation(self, *, link=None):
         """Formatted function return type annotation or empty string if none."""
-        return _return_annotation(self.name, self.module, self.obj, link=link)
-        except TypeError:
-            # Extract annotation from the first line of the docstring for C builtin function
-            f_pattern = re.compile(r'^[a-zA-Z_]\w*\(.*\)'
-                                   r'(?: -> (?P<return_anno>.+))?$\n', re.MULTILINE)
-            f_match = f_pattern.match(self.obj.__doc__)
-            if f_match is None:
-                annot = ''
-            else:
-                annot = f_match.group("return_anno")
-                # Remove signature from docstring variable
-                self.docstring = f_pattern.sub('', self.docstring)
-
+        return _return_annotation(self, link=link)
 
     def params(self, *, annotate: bool = False, link: Callable[[Doc], str] = None) -> List[str]:
         """
@@ -1124,52 +1117,11 @@ class Function(Doc):
     @staticmethod
     def _params(doc_obj, annotate=False, link=None, module=None):
         try:
-            signature = inspect.signature(inspect.unwrap(doc_obj.obj))
+            signature = inspect.signature(doc_obj.obj)
         except ValueError:
-            if doc_obj.obj.__doc__ is None:
-                return ["..."]
-
-            # Extract signature from the first line of the docstring for C builtin function
-            f_pattern = re.compile(r'^(?P<f_name>[a-zA-Z_]\w*)'
-                                   r'\((?P<params_all>.*)\)'
-                                   r'(?: -> (?P<return_anno>.+))?$\n', re.MULTILINE)
-            f_match = f_pattern.match(doc_obj.obj.__doc__)
-            if f_match is None:
-                return ["..."]
-
-            f_name, params_all, return_anno = f_match.group("f_name", "params_all", "return_anno")
-            params_obj = []
-            # TODO: This split condition is valid for `Dict[str, str]` but not for
-            #       something with nested brackets like `Dict[str, Dict[str, str]]`!
-            #       This split condition handles default values like `{1, 2, 3}` or
-            #       `('a', 'b', 'c')` correctly but not nested default values like
-            #       `[{1, 2}, {3, 4}]`
-            # TEST: https://regex101.com/r/lfFY6O/1
-            params_str = re.split(r', (?![^\[\({]*[\]\)}])', params_all)
-            for param_str in params_str:
-                p_match = re.match(r'^(?P<p_kind>\*{0,2})'
-                                   r'(?P<p_name>[a-zA-Z_]\w*)'
-                                   r'(?:: (?P<p_type>[\w\[\]\., ]+))?'
-                                   r'(?: = (?P<p_default>.+))?$', param_str)
-                if p_match is None:
-                    continue
-                p_kind, p_name, p_type, p_default = p_match.group(
-                    "p_kind", "p_name", "p_type", "p_default")
-                kind = inspect.Parameter.POSITIONAL_OR_KEYWORD
-                if len(p_kind) == 1:
-                    kind = inspect.Parameter.VAR_POSITIONAL
-                elif len(p_kind) == 2:
-                    kind = inspect.Parameter.VAR_KEYWORD
-                if p_type is None:
-                    p_type = inspect.Parameter.empty
-                if p_default is None:
-                    p_default = inspect.Parameter.empty
-                param = inspect.Parameter(p_name, kind, default=p_default, annotation=p_type)
-                params_obj.append(param)
-
-            # Remove signature from docstring variable
-            doc_obj.docstring = f_pattern.sub('', doc_obj.docstring)
-            signature = inspect.Signature(params_obj, return_annotation=return_anno)
+            signature = Function._signature_from_string(doc_obj)
+            if not signature:
+                return ['...']
 
         def safe_default_value(p: inspect.Parameter):
             value = p.default
@@ -1243,6 +1195,36 @@ class Function(Doc):
 
         return params
 
+    @staticmethod
+    def _signature_from_string(self):
+        try:
+            return self._cached_docstring_signature
+        except AttributeError:
+            signature = None
+            for expr, cleanup_docstring, filter in (
+                    # Full proper typed signature, such as one from pybind11
+                    (r'^{}\(.*\)(?: -> .*)?$', True, lambda s: s),
+                    # Human-readable, usage-like signature from some Python builtins
+                    # (e.g. `range` or `slice` or `itertools.repeat` or `numpy.arange`)
+                    (r'^{}\(.*\)(?= -|$)', False, lambda s: s.replace('[', '').replace(']', '')),
+            ):
+                strings = sorted(re.findall(expr.format(self.name),
+                                            self.docstring, re.MULTILINE),
+                                 key=len, reverse=True)
+                if strings:
+                    my_locals, my_globals = {}, self.module.obj.__dict__
+                    try:
+                        exec('def {}: pass'.format(filter(strings[0])), my_globals, my_locals)
+                    except SyntaxError:
+                        continue
+                    signature = inspect.signature(my_locals[self.name])
+                    if cleanup_docstring and len(strings) == 1:
+                        # Remove signature from docstring variable
+                        self.docstring = self.docstring.replace(strings[0], '')
+                    break
+            self._cached_docstring_signature = signature
+            return signature
+
     @property
     def refname(self):
         return (self.cls.refname if self.cls else self.module.refname) + '.' + self.name
@@ -1288,7 +1270,7 @@ class Variable(Doc):
 
     def type_annotation(self, *, link=None):
         """Formatted variable type annotation or empty string if none."""
-        return _return_annotation(self.name, self.module, self.obj, link=link)
+        return _return_annotation(self, link=link)
 
 
 class External(Doc):
